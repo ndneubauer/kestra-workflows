@@ -1,0 +1,269 @@
+id: send_one
+namespace: automation.marketing
+
+description: |
+  Claims and sends one approved immutable outbound-message snapshot. This flow
+  is called by send_approved so its task outputs remain static and
+  unambiguous. SMTP is not retried: any failure after a successful claim is
+  quarantined as an uncertain outcome for human review.
+
+inputs:
+  - id: message_id
+    type: INT
+
+  - id: parent_execution_id
+    type: STRING
+
+tasks:
+  - id: claim_message
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    url: jdbc:postgresql://postgres:5432/kestra
+    username: kestra
+    password: "{{ envs.postgres_password | default('changeme') }}"
+    sql: |
+      WITH candidate AS (
+          SELECT o.id
+          FROM marketing.outbound_messages o
+          JOIN marketing.prospects p ON p.id = o.prospect_id
+          WHERE o.id = CAST(:message_id AS bigint)
+            AND o.status = 'pending'
+            AND p.status = 'approved_to_send'
+            AND p.contacted_at IS NULL
+            AND p.do_not_contact_at IS NULL
+          FOR UPDATE OF o SKIP LOCKED
+      ),
+      claimed AS (
+          UPDATE marketing.outbound_messages o
+          SET status = 'sending',
+              claimed_at = now(),
+              kestra_execution_id = :parent_execution_id,
+              updated_at = now()
+          FROM candidate c
+          WHERE o.id = c.id
+          RETURNING o.*
+      ),
+      updated_prospect AS (
+          UPDATE marketing.prospects p
+          SET status = 'sending', updated_at = now()
+          FROM claimed c
+          WHERE p.id = c.prospect_id
+          RETURNING p.id
+      ),
+      event AS (
+          INSERT INTO marketing.state_events
+              (prospect_id, from_status, to_status, action, actor, detail)
+          SELECT
+              c.prospect_id,
+              'approved_to_send',
+              'sending',
+              'smtp_send_claimed',
+              'kestra',
+              jsonb_build_object(
+                  'parent_execution_id', :parent_execution_id,
+                  'send_execution_id', :send_execution_id,
+                  'outbound_message_id', c.id
+              )
+          FROM claimed c
+      )
+      SELECT * FROM claimed
+    parameters:
+      message_id: "{{ inputs.message_id }}"
+      parent_execution_id: "{{ inputs.parent_execution_id }}"
+      send_execution_id: "{{ execution.id }}"
+    fetchType: FETCH_ONE
+
+  - id: send_when_claimed
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.claim_message.row is defined }}"
+    then:
+      - id: smtp_send
+        type: io.kestra.plugin.email.MailSend
+        timeout: PT1M
+        from: "{{ outputs.claim_message.row.sender_email }}"
+        to: "{{ outputs.claim_message.row.recipient_email }}"
+        subject: "{{ outputs.claim_message.row.subject }}"
+        plainTextContent: "{{ outputs.claim_message.row.body }}"
+        htmlTextContent: "{{ outputs.claim_message.row.html_body ?? '' }}"
+
+      - id: mark_sent
+        type: io.kestra.plugin.jdbc.postgresql.Query
+        url: jdbc:postgresql://postgres:5432/kestra
+        username: kestra
+        password: "{{ envs.postgres_password | default('changeme') }}"
+        sql: |
+          WITH input AS MATERIALIZED (
+              SELECT
+                  CAST(:message_id AS bigint) AS message_id,
+                  CAST(:draft_id AS bigint) AS draft_id,
+                  CAST(:prospect_id AS bigint) AS prospect_id,
+                  CAST(:parent_execution_id AS text) AS parent_execution_id,
+                  CAST(:send_execution_id AS text) AS send_execution_id
+          ),
+          sent_message AS (
+              UPDATE marketing.outbound_messages message
+              SET status = 'sent',
+                  sent_at = now(),
+                  updated_at = now()
+              FROM input
+              WHERE message.id = input.message_id
+                AND message.status = 'sending'
+                AND message.kestra_execution_id =
+                    input.parent_execution_id
+              RETURNING
+                  message.id,
+                  message.draft_id,
+                  message.prospect_id
+          ),
+          sent_draft AS (
+              UPDATE marketing.drafts draft
+              SET status = 'sent'
+              FROM input
+              JOIN sent_message message
+                ON message.draft_id = input.draft_id
+              WHERE draft.id = input.draft_id
+              RETURNING draft.id
+          ),
+          contacted_prospect AS (
+              UPDATE marketing.prospects prospect
+              SET status = 'contacted',
+                  contacted_at = now(),
+                  updated_at = now()
+              FROM input
+              JOIN sent_message message
+                ON message.prospect_id = input.prospect_id
+              JOIN sent_draft draft
+                ON draft.id = input.draft_id
+              WHERE prospect.id = input.prospect_id
+                AND prospect.status = 'sending'
+              RETURNING prospect.id
+          ),
+          inserted_event AS (
+              INSERT INTO marketing.state_events
+                  (prospect_id, from_status, to_status, action,
+                   actor, detail)
+              SELECT
+                  prospect.id,
+                  'sending',
+                  'contacted',
+                  'smtp_send_succeeded',
+                  'kestra',
+                  jsonb_build_object(
+                      'parent_execution_id', input.parent_execution_id,
+                      'send_execution_id', input.send_execution_id,
+                      'outbound_message_id', message.id
+                  )
+              FROM contacted_prospect prospect
+              CROSS JOIN input
+              JOIN sent_message message
+                ON message.prospect_id = prospect.id
+              RETURNING id
+          )
+          SELECT count(*) AS persisted_event_count
+          FROM inserted_event
+        parameters:
+          message_id: "{{ outputs.claim_message.row.id }}"
+          draft_id: "{{ outputs.claim_message.row.draft_id }}"
+          prospect_id: "{{ outputs.claim_message.row.prospect_id }}"
+          parent_execution_id: "{{ inputs.parent_execution_id }}"
+          send_execution_id: "{{ execution.id }}"
+        fetchType: FETCH_ONE
+
+errors:
+  - id: mark_send_ambiguous
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    url: jdbc:postgresql://postgres:5432/kestra
+    username: kestra
+    password: "{{ envs.postgres_password | default('changeme') }}"
+    runIf: "{{ outputs.claim_message.row is defined }}"
+    sql: |
+      WITH input AS MATERIALIZED (
+          SELECT
+              CAST(:message_id AS bigint) AS message_id,
+              CAST(:prospect_id AS bigint) AS prospect_id,
+              CAST(:parent_execution_id AS text) AS parent_execution_id,
+              CAST(:send_execution_id AS text) AS send_execution_id
+      ),
+      ambiguous_message AS (
+          UPDATE marketing.outbound_messages message
+          SET status = 'ambiguous',
+              error_message =
+                  'SMTP execution failed or timed out; verify mailbox and provider before any retry',
+              updated_at = now()
+          FROM input
+          WHERE message.id = input.message_id
+            AND message.status = 'sending'
+            AND message.kestra_execution_id = input.parent_execution_id
+          RETURNING message.id, message.prospect_id
+      ),
+      ambiguous_prospect AS (
+          UPDATE marketing.prospects prospect
+          SET status = 'send_ambiguous',
+              last_error =
+                  'SMTP outcome is uncertain; inspect Kestra execution '
+                  || input.send_execution_id,
+              updated_at = now()
+          FROM input
+          JOIN ambiguous_message message
+            ON message.prospect_id = input.prospect_id
+          WHERE prospect.id = input.prospect_id
+            AND prospect.status = 'sending'
+          RETURNING prospect.id
+      ),
+      inserted_event AS (
+          INSERT INTO marketing.state_events
+              (prospect_id, from_status, to_status, action, actor, detail)
+          SELECT
+              prospect.id,
+              'sending',
+              'send_ambiguous',
+              'smtp_send_ambiguous',
+              'kestra',
+              jsonb_build_object(
+                  'parent_execution_id', input.parent_execution_id,
+                  'send_execution_id', input.send_execution_id,
+                  'outbound_message_id', message.id
+              )
+          FROM ambiguous_prospect prospect
+          CROSS JOIN input
+          JOIN ambiguous_message message
+            ON message.prospect_id = prospect.id
+          RETURNING id
+      )
+      SELECT count(*) AS persisted_event_count
+      FROM inserted_event
+    parameters:
+      message_id: "{{ outputs.claim_message.row.id }}"
+      prospect_id: "{{ outputs.claim_message.row.prospect_id }}"
+      parent_execution_id: "{{ inputs.parent_execution_id }}"
+      send_execution_id: "{{ execution.id }}"
+    fetchType: FETCH_ONE
+
+  - id: alert_send_ambiguous
+    type: io.kestra.plugin.email.MailSend
+    runIf: "{{ outputs.claim_message.row is defined }}"
+    from: "{{ envs.consulting_email }}"
+    to: "{{ envs.consulting_email }}"
+    subject: >-
+      CHECK SMTP OUTCOME — outreach {{ execution.id }}
+    plainTextContent: |
+      An approved prospect email had an uncertain SMTP outcome.
+
+      Prospect ID: {{ outputs.claim_message.row.prospect_id }}
+      Recipient: {{ outputs.claim_message.row.recipient_email }}
+      Parent execution: {{ inputs.parent_execution_id }}
+      Send execution: {{ execution.id }}
+
+      The message has been marked ambiguous and will not retry
+      automatically. Check the sent mailbox and SMTP provider before taking
+      any further action.
+
+pluginDefaults:
+  - type: io.kestra.plugin.email.MailSend
+    values:
+      host: "{{ envs.smtp_host }}"
+      port: "{{ envs.smtp_port }}"
+      username: "{{ envs.smtp_username }}"
+      password: "{{ envs.smtp_password }}"
+      transportStrategy: SMTP_TLS
+      sessionTimeout: 30000
+      verifyServerIdentity: true

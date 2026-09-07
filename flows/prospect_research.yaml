@@ -1,0 +1,46 @@
+id: prospect_research
+namespace: automation.marketing
+
+description: |
+  Manually snapshots every prospect currently eligible for research and
+  processes the queue serially through research_one. A failed child
+  execution records and emails its own prospect-specific failure, while the
+  parent continues with the remaining snapshot. This flow has no trigger.
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+tasks:
+  - id: list_queued_prospects
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    url: jdbc:postgresql://postgres:5432/kestra
+    username: kestra
+    password: "{{ envs.postgres_password | default('changeme') }}"
+    sql: |
+      SELECT id
+      FROM marketing.prospects
+      WHERE next_research_at <= now()
+        AND (
+            status IN ('queued', 'research_requested')
+            OR (status = 'research_failed' AND research_attempts < 3)
+        )
+      ORDER BY
+          CASE status WHEN 'research_requested' THEN 0 ELSE 1 END,
+          next_research_at,
+          id
+    fetchType: FETCH
+
+  - id: research_queued_prospects
+    type: io.kestra.plugin.core.flow.ForEach
+    values: "{{ outputs.list_queued_prospects.rows }}"
+    concurrencyLimit: 1
+    tasks:
+      - id: research_one_prospect
+        type: io.kestra.plugin.core.flow.Subflow
+        namespace: automation.marketing
+        flowId: research_one
+        wait: true
+        transmitFailed: false
+        inputs:
+          prospect_id: "{{ fromJson(taskrun.value).id }}"

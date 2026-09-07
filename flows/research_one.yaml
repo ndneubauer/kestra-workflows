@@ -1,0 +1,467 @@
+id: research_one
+namespace: automation.marketing
+
+description: |
+  Claims one explicitly selected prospect, runs two versioned Exa searches,
+  validates evidence with Python, uses local Gemma for bounded extraction and
+  drafting, and stores the complete review state in PostgreSQL. It is normally
+  called by the manual queue-draining parent flow and never emails prospects.
+
+inputs:
+  - id: prospect_id
+    type: INT
+
+variables:
+  research_profile_version: research-v1
+  ollama_model: gemma4-nothink:12b
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+tasks:
+  - id: claim_prospect
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    url: jdbc:postgresql://postgres:5432/kestra
+    username: kestra
+    password: "{{ envs.postgres_password | default('changeme') }}"
+    sql: |
+      WITH candidate AS (
+          SELECT id, status AS from_status
+          FROM marketing.prospects
+          WHERE id = CAST(:prospect_id AS bigint)
+            AND next_research_at <= now()
+            AND (
+                status IN ('queued', 'research_requested')
+                OR (status = 'research_failed' AND research_attempts < 3)
+            )
+          FOR UPDATE SKIP LOCKED
+      ),
+      claimed AS (
+          UPDATE marketing.prospects p
+          SET status = 'researching',
+              research_attempts = research_attempts + 1,
+              last_error = NULL,
+              updated_at = now()
+          FROM candidate c
+          WHERE p.id = c.id
+          RETURNING p.*, c.from_status
+      )
+      SELECT * FROM claimed
+    parameters:
+      prospect_id: "{{ inputs.prospect_id }}"
+    fetchType: FETCH_ONE
+
+  - id: process_claim
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.claim_prospect.row is defined }}"
+    then:
+      - id: record_research_start
+        type: io.kestra.plugin.jdbc.postgresql.Query
+        url: jdbc:postgresql://postgres:5432/kestra
+        username: kestra
+        password: "{{ envs.postgres_password | default('changeme') }}"
+        sql: |
+          WITH input AS MATERIALIZED (
+              SELECT
+                  CAST(:prospect_id AS bigint) AS prospect_id,
+                  CAST(:execution_id AS text) AS execution_id,
+                  CAST(:profile_version AS text) AS profile_version,
+                  CAST(:attempt AS integer) AS attempt,
+                  CAST(:from_status AS text) AS from_status
+          ),
+          inserted_run AS (
+              INSERT INTO marketing.research_runs
+                  (prospect_id, kestra_execution_id, profile_version, attempt, status)
+              SELECT
+                  input.prospect_id,
+                  input.execution_id,
+                  input.profile_version,
+                  input.attempt,
+                  'running'
+              FROM input
+              RETURNING id
+          ),
+          inserted_event AS (
+              INSERT INTO marketing.state_events
+                  (prospect_id, from_status, to_status, action, actor, detail)
+              SELECT
+                  input.prospect_id,
+                  input.from_status,
+                  'researching',
+                  'research_claimed',
+                  'kestra',
+                  jsonb_build_object('execution_id', input.execution_id)
+              FROM input
+              CROSS JOIN inserted_run
+              RETURNING id
+          )
+          SELECT count(*) AS persisted_event_count
+          FROM inserted_event
+        parameters:
+          prospect_id: "{{ outputs.claim_prospect.row.id }}"
+          execution_id: "{{ execution.id }}"
+          profile_version: "{{ vars.research_profile_version }}"
+          attempt: "{{ outputs.claim_prospect.row.research_attempts }}"
+          from_status: "{{ outputs.claim_prospect.row.from_status }}"
+        fetchType: FETCH_ONE
+
+      - id: collect_public_research
+        type: io.kestra.plugin.scripts.python.Commands
+        timeout: PT4M
+        retry:
+          type: exponential
+          interval: PT20S
+          maxInterval: PT2M
+          maxAttempts: 3
+        taskRunner:
+          type: io.kestra.plugin.core.runner.Process
+        env:
+          PROSPECT_JSON: "{{ outputs.claim_prospect.row | toJson }}"
+          EXA_API_KEY: "{{ envs.exa_api_key }}"
+          RESEARCH_PROFILE_VERSION: "{{ vars.research_profile_version }}"
+        commands:
+          - python /app/prospecting/worker.py collect
+
+      - id: extract_validate_and_score
+        type: io.kestra.plugin.scripts.python.Commands
+        timeout: PT6M
+        retry:
+          type: exponential
+          interval: PT20S
+          maxInterval: PT2M
+          maxAttempts: 2
+        taskRunner:
+          type: io.kestra.plugin.core.runner.Process
+        env:
+          RESEARCH_JSON: "{{ outputs.collect_public_research.vars.research_json }}"
+          OLLAMA_ENDPOINT: http://host.docker.internal:11434/api/chat
+          OLLAMA_MODEL: "{{ vars.ollama_model }}"
+        commands:
+          - python /app/prospecting/worker.py extract-score
+
+      - id: load_active_template
+        type: io.kestra.plugin.jdbc.postgresql.Query
+        url: jdbc:postgresql://postgres:5432/kestra
+        username: kestra
+        password: "{{ envs.postgres_password | default('changeme') }}"
+        sql: |
+          SELECT
+              id,
+              version,
+              subject_template,
+              body_template
+          FROM marketing.email_templates
+          WHERE is_active
+          ORDER BY version DESC
+          LIMIT 1
+        fetchType: FETCH_ONE
+
+      - id: draft_message
+        type: io.kestra.plugin.scripts.python.Commands
+        timeout: PT6M
+        retry:
+          type: exponential
+          interval: PT20S
+          maxInterval: PT2M
+          maxAttempts: 2
+        taskRunner:
+          type: io.kestra.plugin.core.runner.Process
+        env:
+          PROSPECT_JSON: "{{ outputs.claim_prospect.row | toJson }}"
+          EXTRACTED_JSON: "{{ outputs.extract_validate_and_score.vars.extracted_json }}"
+          TEMPLATE_JSON: "{{ outputs.load_active_template.row | toJson }}"
+          OLLAMA_ENDPOINT: http://host.docker.internal:11434/api/chat
+          OLLAMA_MODEL: "{{ vars.ollama_model }}"
+        commands:
+          - python /app/prospecting/worker.py draft
+
+      - id: persist_review
+        type: io.kestra.plugin.jdbc.postgresql.Query
+        url: jdbc:postgresql://postgres:5432/kestra
+        username: kestra
+        password: "{{ envs.postgres_password | default('changeme') }}"
+        sql: |
+          WITH input AS MATERIALIZED (
+              SELECT
+                  CAST(:prospect_id AS bigint) AS prospect_id,
+                  CAST(:execution_id AS text) AS execution_id,
+                  CAST(:queries_json AS jsonb) AS queries,
+                  CAST(:research_json AS jsonb) AS research,
+                  CAST(:extracted_json AS jsonb) AS extracted,
+                  CAST(:draft_json AS jsonb) AS draft
+          ),
+          completed_research AS (
+              UPDATE marketing.research_runs runs
+              SET status = 'completed',
+                  queries = input.queries,
+                  raw_results = input.research,
+                  extracted_data = input.extracted,
+                  finished_at = now()
+              FROM input
+              WHERE runs.prospect_id = input.prospect_id
+                AND runs.kestra_execution_id = input.execution_id
+              RETURNING runs.id
+          ),
+          superseded_drafts AS (
+              UPDATE marketing.drafts drafts
+              SET status = 'superseded'
+              FROM input
+              WHERE drafts.prospect_id = input.prospect_id
+                AND drafts.status = 'current'
+                AND CAST(input.draft->>'draft_eligible' AS boolean)
+              RETURNING drafts.id
+          ),
+          inserted_draft AS (
+              INSERT INTO marketing.drafts
+                  (prospect_id, version, subject, body, created_by, status,
+                   template_id, personalised_message)
+              SELECT
+                  input.prospect_id,
+                  COALESCE((
+                      SELECT max(version) + 1
+                      FROM marketing.drafts
+                      WHERE prospect_id = input.prospect_id
+                  ), 1),
+                  input.draft->>'subject',
+                  input.draft->>'body',
+                  concat(
+                      'llm',
+                      chr(58),
+                      'gemma4',
+                      chr(58),
+                      '12b'
+                  ),
+                  'current',
+                  CAST(input.draft->>'template_id' AS bigint),
+                  input.draft->>'personalised_message'
+              FROM input
+              CROSS JOIN (
+                  SELECT count(*) AS superseded_count
+                  FROM superseded_drafts
+              ) dependency
+              WHERE CAST(input.draft->>'draft_eligible' AS boolean)
+              RETURNING id
+          ),
+          updated_prospect AS (
+              UPDATE marketing.prospects prospect
+              SET status = CASE
+                      WHEN CAST(input.extracted->>'disqualify' AS boolean)
+                          THEN 'disqualified'
+                      WHEN CAST(input.draft->>'draft_eligible' AS boolean)
+                          THEN 'awaiting_approval'
+                      ELSE 'research_failed'
+                  END,
+                  website_url =
+                      NULLIF(input.extracted->>'website_url', ''),
+                  contact_name =
+                      COALESCE(prospect.contact_name, NULLIF(input.extracted->>'contact_name', '')),
+                  contact_role =
+                      COALESCE(prospect.contact_role, NULLIF(input.extracted->>'contact_role', '')),
+                  contact_email =
+                      COALESCE(prospect.contact_email, NULLIF(input.extracted->>'contact_email', '')),
+                  personalization_detail =
+                      NULLIF(input.extracted->>'personalization_detail', ''),
+                  personalization_source_url =
+                      NULLIF(
+                          input.extracted->>'personalization_source_url',
+                          ''
+                      ),
+                  personalization_evidence =
+                      NULLIF(
+                          input.extracted->>'personalization_evidence',
+                          ''
+                      ),
+                  fit_score =
+                      CAST(input.extracted->>'fit_score' AS smallint),
+                  score_explanation =
+                      NULLIF(input.extracted->>'score_explanation', ''),
+                  research_confidence =
+                      NULLIF(input.extracted->>'confidence', ''),
+                  last_researched_at = now(),
+                  next_research_at = CASE
+                      WHEN CAST(input.draft->>'draft_eligible' AS boolean)
+                          THEN prospect.next_research_at
+                      ELSE now() + interval '6 hours'
+                  END,
+                  last_error = CASE
+                      WHEN CAST(input.draft->>'draft_eligible' AS boolean)
+                          THEN NULL
+                      WHEN CAST(input.extracted->>'disqualify' AS boolean)
+                          THEN NULLIF(
+                              input.extracted->>'disqualify_reason',
+                              ''
+                          )
+                      ELSE NULLIF(input.draft->>'reason', '')
+                  END,
+                  updated_at = now()
+              FROM input
+              WHERE prospect.id = input.prospect_id
+              RETURNING prospect.id, prospect.status
+          ),
+          inserted_event AS (
+              INSERT INTO marketing.state_events
+                  (prospect_id, from_status, to_status, action, actor, detail)
+              SELECT
+                  updated.id,
+                  'researching',
+                  updated.status,
+                  'research_completed',
+                  'kestra',
+                  jsonb_build_object(
+                      'execution_id', input.execution_id,
+                      'fit_score',
+                          CAST(input.extracted->>'fit_score' AS integer),
+                      'draft_eligible',
+                          CAST(
+                              input.draft->>'draft_eligible'
+                              AS boolean
+                          )
+                  )
+              FROM updated_prospect updated
+              CROSS JOIN input
+              RETURNING id
+          )
+          SELECT count(*) AS persisted_event_count
+          FROM inserted_event
+        fetchType: FETCH_ONE
+        parameters:
+          prospect_id: "{{ outputs.claim_prospect.row.id }}"
+          execution_id: "{{ execution.id }}"
+          queries_json: "{{ outputs.collect_public_research.vars.queries_json }}"
+          research_json: "{{ outputs.collect_public_research.vars.research_json }}"
+          extracted_json: "{{ outputs.extract_validate_and_score.vars.extracted_json }}"
+          draft_json: "{{ outputs.draft_message.vars.draft_json }}"
+
+      - id: notify_when_not_reviewable
+        type: io.kestra.plugin.core.flow.If
+        condition: >-
+          {{ outputs.draft_message.vars.draft_eligible == false }}
+        then:
+          - id: email_research_outcome
+            type: io.kestra.plugin.email.MailSend
+            timeout: PT1M
+            allowFailure: true
+            retry:
+              type: constant
+              interval: PT15S
+              maxAttempts: 3
+            from: "{{ envs.consulting_email }}"
+            to: "{{ envs.consulting_email }}"
+            subject: >-
+              RESEARCH NEEDS ATTENTION — {{ outputs.claim_prospect.row.business_name }}
+            plainTextContent: |
+              Prospect research completed, but no reviewable email draft was
+              created.
+
+              Prospect: {{ outputs.claim_prospect.row.business_name }}
+              Location: {{ outputs.claim_prospect.row.branch_location ?? outputs.claim_prospect.row.region }}
+              Prospect ID: {{ outputs.claim_prospect.row.id }}
+              Reason: {{ outputs.draft_message.vars.reason }}
+              Fit score: {{ outputs.extract_validate_and_score.vars.fit_score }}/100
+              Confidence: {{ outputs.extract_validate_and_score.vars.confidence }}
+              Website: {{ outputs.extract_validate_and_score.vars.website_url }}
+              Published recipient: {{ outputs.extract_validate_and_score.vars.contact_email }}
+              Personalisation: {{ outputs.extract_validate_and_score.vars.personalization_detail }}
+              Disqualified: {{ outputs.extract_validate_and_score.vars.disqualify }}
+              Disqualification reason: {{ outputs.extract_validate_and_score.vars.disqualify_reason }}
+
+              Kestra execution: {{ execution.id }}
+              Review locally:
+              http://localhost:9012/prospects/{{ outputs.claim_prospect.row.id }}
+
+              No prospect email was sent.
+
+errors:
+  - id: mark_research_failed
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    url: jdbc:postgresql://postgres:5432/kestra
+    username: kestra
+    password: "{{ envs.postgres_password | default('changeme') }}"
+    runIf: "{{ outputs.claim_prospect.row is defined }}"
+    sql: |
+      WITH input AS MATERIALIZED (
+          SELECT
+              CAST(:prospect_id AS bigint) AS prospect_id,
+              CAST(:execution_id AS text) AS execution_id
+      ),
+      failed_run AS (
+          UPDATE marketing.research_runs run
+          SET status = 'failed',
+              error_message =
+                  'Kestra execution failed; inspect execution logs',
+              finished_at = now()
+          FROM input
+          WHERE run.prospect_id = input.prospect_id
+            AND run.kestra_execution_id = input.execution_id
+          RETURNING run.id
+      ),
+      failed_prospect AS (
+          UPDATE marketing.prospects prospect
+          SET status = 'research_failed',
+              next_research_at = now() + interval '2 hours',
+              last_error =
+                  'Research execution failed; inspect Kestra execution '
+                  || input.execution_id,
+              updated_at = now()
+          FROM input
+          WHERE prospect.id = input.prospect_id
+            AND prospect.status = 'researching'
+          RETURNING prospect.id
+      ),
+      inserted_event AS (
+          INSERT INTO marketing.state_events
+              (prospect_id, from_status, to_status, action, actor, detail)
+          SELECT
+              prospect.id,
+              'researching',
+              'research_failed',
+              'research_execution_failed',
+              'kestra',
+              jsonb_build_object('execution_id', input.execution_id)
+          FROM failed_prospect prospect
+          CROSS JOIN input
+          RETURNING id
+      )
+      SELECT
+          (SELECT count(*) FROM failed_run) AS failed_run_count,
+          (SELECT count(*) FROM inserted_event) AS persisted_event_count
+    parameters:
+      prospect_id: "{{ outputs.claim_prospect.row.id }}"
+      execution_id: "{{ execution.id }}"
+    fetchType: FETCH_ONE
+
+  - id: email_research_execution_failure
+    type: io.kestra.plugin.email.MailSend
+    timeout: PT1M
+    allowFailure: true
+    runIf: "{{ outputs.claim_prospect.row is defined }}"
+    retry:
+      type: constant
+      interval: PT15S
+      maxAttempts: 3
+    from: "{{ envs.consulting_email }}"
+    to: "{{ envs.consulting_email }}"
+    subject: >-
+      RESEARCH EXECUTION FAILED — {{ outputs.claim_prospect.row.business_name }}
+    plainTextContent: |
+      Prospect research failed because the Kestra execution did not complete.
+
+      Prospect: {{ outputs.claim_prospect.row.business_name }}
+      Location: {{ outputs.claim_prospect.row.branch_location ?? outputs.claim_prospect.row.region }}
+      Prospect ID: {{ outputs.claim_prospect.row.id }}
+      Kestra execution: {{ execution.id }}
+
+      Inspect the execution logs in Kestra. The prospect has been marked
+      research_failed and no prospect email was sent.
+
+pluginDefaults:
+  - type: io.kestra.plugin.email.MailSend
+    values:
+      host: "{{ envs.smtp_host }}"
+      port: "{{ envs.smtp_port }}"
+      username: "{{ envs.smtp_username }}"
+      password: "{{ envs.smtp_password }}"
+      transportStrategy: SMTP_TLS
+      sessionTimeout: 30000
+      verifyServerIdentity: true

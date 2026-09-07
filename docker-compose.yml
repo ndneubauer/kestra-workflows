@@ -1,0 +1,111 @@
+volumes:
+  postgres-data:
+    driver: local
+  kestra-data:
+    driver: local
+  airtasker-oauth:
+
+services:
+  postgres:
+    image: postgres:18
+    volumes:
+      - postgres-data:/var/lib/postgresql
+      - ./db:/docker-entrypoint-initdb.d:ro
+    environment:
+      POSTGRES_DB: kestra
+      POSTGRES_USER: kestra
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+    restart: unless-stopped
+
+  kestra:
+    image: kestra/kestra:latest
+    pull_policy: always
+    stop_grace_period: 6m
+    user: "root"
+    command: server standalone --worker-thread=1
+    restart: unless-stopped
+    volumes:
+      - kestra-data:/app/storage
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/kestra-wd:/tmp/kestra-wd
+      - airtasker-oauth:/app/airtasker-oauth
+      - ./prospecting:/app/prospecting:ro
+      - ./flows:/app/flows:ro
+      - ./certs/network-inspector:/app/network-inspector-certs:ro
+    env_file:
+      - .env
+    extra_hosts:
+      - "${BACKUP_SERVER_HOST:-backup.example.internal}:${BACKUP_SERVER_IP:-192.0.2.61}"
+      - "${MAIL_LAN_HOST:-mail.example.internal}:${BACKUP_SERVER_IP:-192.0.2.61}"
+    environment:
+      KESTRA_CONFIGURATION: |
+        datasources:
+          postgres:
+            url: jdbc:postgresql://postgres:5432/kestra
+            driverClassName: org.postgresql.Driver
+            username: kestra
+            password: "${POSTGRES_PASSWORD:-changeme}"
+        kestra:
+          repository:
+            type: postgres
+          storage:
+            type: local
+            local:
+              base-path: "/app/storage"
+          queue:
+            type: postgres
+          jdbc:
+            # Keep execution coordination single-threaded as well as task
+            # execution. This does not alter parallel tasks within a flow;
+            # it limits the instance's executor capacity to one.
+            executor:
+              thread-count: 1
+          tasks:
+            tmp-dir:
+              path: /tmp/kestra-wd/tmp
+          url: http://localhost:9002/
+          local-files:
+            allowed-paths:
+              - /app/airtasker-oauth
+              - /app/prospecting
+              - /app/flows
+    ports:
+      - "9002:8080"
+      - "9022:8081"
+    depends_on:
+      postgres:
+        condition: service_started
+
+  prospect-review:
+    build:
+      context: .
+      dockerfile: prospecting/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://kestra:${POSTGRES_PASSWORD:-changeme}@postgres:5432/kestra
+      OUTREACH_FROM_EMAIL: ${OUTREACH_FROM_EMAIL:-you@example.com}
+      OUTREACH_BUSINESS_NAME: ${OUTREACH_BUSINESS_NAME:-Example Business}
+    ports:
+      - "127.0.0.1:9012:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  adminer:
+    image: adminer:5
+    restart: unless-stopped
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+      ADMINER_DESIGN: pepa-linha-dark
+    ports:
+      - "127.0.0.1:9011:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy

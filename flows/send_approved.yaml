@@ -1,0 +1,150 @@
+id: send_approved
+namespace: automation.marketing
+
+description: |
+  Drains all human-approved immutable message snapshots that are pending when
+  the hourly execution starts. Each message is handled by a child flow so
+  claim and SMTP outputs are static and independently visible. Messages are
+  sent serially, and SMTP is deliberately not retried.
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+tasks:
+  - id: list_pending_messages
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    url: jdbc:postgresql://postgres:5432/kestra
+    username: kestra
+    password: "{{ envs.postgres_password | default('changeme') }}"
+    sql: |
+      SELECT o.id
+      FROM marketing.outbound_messages o
+      JOIN marketing.prospects p ON p.id = o.prospect_id
+      WHERE o.status = 'pending'
+        AND p.status = 'approved_to_send'
+        AND p.contacted_at IS NULL
+        AND p.do_not_contact_at IS NULL
+      ORDER BY o.approved_at, o.id
+    fetchType: FETCH
+
+  - id: send_pending_messages
+    type: io.kestra.plugin.core.flow.ForEach
+    values: "{{ outputs.list_pending_messages.rows }}"
+    concurrencyLimit: 1
+    tasks:
+      - id: send_one_message
+        type: io.kestra.plugin.core.flow.Subflow
+        namespace: automation.marketing
+        flowId: send_one
+        wait: true
+        transmitFailed: false
+        inputs:
+          message_id: "{{ fromJson(taskrun.value).id }}"
+          parent_execution_id: "{{ execution.id }}"
+
+  - id: reconcile_stranded_sends
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    url: jdbc:postgresql://postgres:5432/kestra
+    username: kestra
+    password: "{{ envs.postgres_password | default('changeme') }}"
+    sql: |
+      WITH input AS MATERIALIZED (
+          SELECT CAST(:execution_id AS text) AS execution_id
+      ),
+      stranded_messages AS (
+          UPDATE marketing.outbound_messages message
+          SET status = 'ambiguous',
+              error_message =
+                  'Send flow ended while message was still claimed; verify mailbox before retry',
+              updated_at = now()
+          FROM input
+          WHERE message.status = 'sending'
+            AND message.kestra_execution_id = input.execution_id
+          RETURNING
+              message.id,
+              message.prospect_id,
+              message.recipient_email
+      ),
+      stranded_prospects AS (
+          UPDATE marketing.prospects prospect
+          SET status = 'send_ambiguous',
+              last_error =
+                  'Send flow ended with an unresolved claim; inspect Kestra execution '
+                  || input.execution_id,
+              updated_at = now()
+          FROM input, stranded_messages message
+          WHERE message.prospect_id = prospect.id
+            AND prospect.status = 'sending'
+          RETURNING prospect.id
+      ),
+      inserted_events AS (
+          INSERT INTO marketing.state_events
+              (prospect_id, from_status, to_status, action, actor, detail)
+          SELECT
+              prospect.id,
+              'sending',
+              'send_ambiguous',
+              'send_claim_reconciled_as_ambiguous',
+              'kestra',
+              jsonb_build_object(
+                  'execution_id', input.execution_id,
+                  'outbound_message_id', message.id
+              )
+          FROM stranded_prospects prospect
+          CROSS JOIN input
+          JOIN stranded_messages message
+            ON message.prospect_id = prospect.id
+          RETURNING id
+      )
+      SELECT
+          count(*) AS stranded_count,
+          COALESCE(
+              string_agg(
+                  CAST(message.id AS text) || ' <' ||
+                  message.recipient_email || '>',
+                  ', ' ORDER BY message.id
+              ),
+              ''
+          ) AS stranded_messages
+      FROM stranded_messages message
+    parameters:
+      execution_id: "{{ execution.id }}"
+    fetchType: FETCH_ONE
+
+  - id: alert_stranded_sends
+    type: io.kestra.plugin.email.MailSend
+    runIf: >-
+      {{ outputs.reconcile_stranded_sends.row.stranded_count > 0 }}
+    from: "{{ envs.consulting_email }}"
+    to: "{{ envs.consulting_email }}"
+    subject: >-
+      CHECK SMTP OUTCOMES — outreach {{ execution.id }}
+    plainTextContent: |
+      The hourly sender ended with one or more unresolved message claims.
+
+      Execution: {{ execution.id }}
+      Count: {{ outputs.reconcile_stranded_sends.row.stranded_count }}
+      Messages: {{ outputs.reconcile_stranded_sends.row.stranded_messages }}
+
+      These records were marked send_ambiguous and will not retry
+      automatically. Check the sent mailbox and SMTP provider before taking
+      any further action.
+
+triggers:
+  - id: send_queue
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "@hourly"
+    timezone: Australia/Brisbane
+    allowConcurrent: false
+
+pluginDefaults:
+  - type: io.kestra.plugin.email.MailSend
+    values:
+      host: "{{ envs.smtp_host }}"
+      port: "{{ envs.smtp_port }}"
+      username: "{{ envs.smtp_username }}"
+      password: "{{ envs.smtp_password }}"
+      transportStrategy: SMTP_TLS
+      sessionTimeout: 30000
+      verifyServerIdentity: true

@@ -1,0 +1,177 @@
+id: network_inspector_preflight
+namespace: automation.infrastructure
+
+description: |
+  Verifies read-only HTTPS access from Kestra to OPNsense, the Wazuh manager,
+  and the Wazuh indexer. Outputs contain only sanitized health and inventory
+  counts. This flow performs no network scan and has no schedule.
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+tasks:
+  - id: verify_source_access
+    type: io.kestra.plugin.scripts.python.Script
+    description: Authenticate to each authoritative source and verify basic access.
+    timeout: PT2M
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    env:
+      OPNSENSE_URL: "{{ envs.opnsense_url }}"
+      OPNSENSE_API_KEY: "{{ envs.opnsense_api_key }}"
+      OPNSENSE_API_SECRET: "{{ envs.opnsense_api_secret }}"
+      WAZUH_API_URL: "{{ envs.wazuh_api_url }}"
+      WAZUH_API_USERNAME: "{{ envs.wazuh_api_username }}"
+      WAZUH_API_PASSWORD: "{{ envs.wazuh_api_password }}"
+      WAZUH_INDEXER_URL: "{{ envs.wazuh_indexer_url }}"
+      WAZUH_INDEXER_USERNAME: "{{ envs.wazuh_indexer_username }}"
+      WAZUH_INDEXER_PASSWORD: "{{ envs.wazuh_indexer_password }}"
+    script: |
+      import base64
+      import json
+      import os
+      import ssl
+      import urllib.error
+      import urllib.request
+
+      TIMEOUT_SECONDS = 20
+      CA_DIRECTORY = "/app/network-inspector-certs"
+
+      def required(name):
+          value = os.environ.get(name, "").strip()
+          if not value:
+              raise ValueError(f"{name} is not configured")
+          return value
+
+      def https_url(name):
+          value = required(name).rstrip("/")
+          if not value.startswith("https://"):
+              raise ValueError(f"{name} must use HTTPS")
+          return value
+
+      def tls_context(ca_filename):
+          ca_path = os.path.join(CA_DIRECTORY, ca_filename)
+          if os.path.isfile(ca_path):
+              return ssl.create_default_context(cafile=ca_path)
+          return ssl.create_default_context()
+
+      def basic_authorization(username, password):
+          encoded = base64.b64encode(
+              f"{username}:{password}".encode("utf-8")
+          ).decode("ascii")
+          return f"Basic {encoded}"
+
+      def request_json(url, context, method="GET", headers=None, body=None):
+          request_headers = {
+              "Accept": "application/json",
+              "User-Agent": "Kestra-Network-Inspector/0.1",
+          }
+          request_headers.update(headers or {})
+          encoded_body = None
+          if body is not None:
+              encoded_body = json.dumps(body).encode("utf-8")
+              request_headers["Content-Type"] = "application/json"
+          request = urllib.request.Request(
+              url,
+              data=encoded_body,
+              headers=request_headers,
+              method=method,
+          )
+          try:
+              with urllib.request.urlopen(
+                  request,
+                  timeout=TIMEOUT_SECONDS,
+                  context=context,
+              ) as response:
+                  return response.status, json.load(response)
+          except urllib.error.HTTPError as error:
+              raise RuntimeError(
+                  f"{method} {url} returned HTTP {error.code}"
+              ) from error
+          except urllib.error.URLError as error:
+              raise RuntimeError(
+                  f"{method} {url} failed: {error.reason}"
+              ) from error
+
+      opnsense_url = https_url("OPNSENSE_URL")
+      opnsense_headers = {
+          "Authorization": basic_authorization(
+              required("OPNSENSE_API_KEY"),
+              required("OPNSENSE_API_SECRET"),
+          )
+      }
+      opnsense_tls = tls_context("opnsense-ca.pem")
+      _, opnsense_time = request_json(
+          f"{opnsense_url}/api/diagnostics/system/system_time",
+          opnsense_tls,
+          headers=opnsense_headers,
+      )
+      _, opnsense_interfaces = request_json(
+          f"{opnsense_url}/api/diagnostics/interface/get_interface_names",
+          opnsense_tls,
+          headers=opnsense_headers,
+      )
+
+      wazuh_api_url = https_url("WAZUH_API_URL")
+      wazuh_api_tls = tls_context("wazuh-ca.pem")
+      wazuh_auth_headers = {
+          "Authorization": basic_authorization(
+              required("WAZUH_API_USERNAME"),
+              required("WAZUH_API_PASSWORD"),
+          )
+      }
+      _, authentication = request_json(
+          f"{wazuh_api_url}/security/user/authenticate",
+          wazuh_api_tls,
+          method="POST",
+          headers=wazuh_auth_headers,
+      )
+      token = authentication.get("data", {}).get("token", "")
+      if not token:
+          raise RuntimeError("Wazuh manager authentication returned no token")
+      wazuh_bearer_headers = {"Authorization": f"Bearer {token}"}
+      _, manager_info = request_json(
+          f"{wazuh_api_url}/manager/info",
+          wazuh_api_tls,
+          headers=wazuh_bearer_headers,
+      )
+      _, agent_status = request_json(
+          f"{wazuh_api_url}/agents/summary/status",
+          wazuh_api_tls,
+          headers=wazuh_bearer_headers,
+      )
+
+      indexer_url = https_url("WAZUH_INDEXER_URL")
+      indexer_headers = {
+          "Authorization": basic_authorization(
+              required("WAZUH_INDEXER_USERNAME"),
+              required("WAZUH_INDEXER_PASSWORD"),
+          )
+      }
+      _, indexer_health = request_json(
+          f"{indexer_url}/_cluster/health",
+          tls_context("wazuh-indexer-ca.pem"),
+          headers=indexer_headers,
+      )
+
+      manager_data = manager_info.get("data", {}).get("affected_items", [])
+      agent_data = agent_status.get("data", {})
+      agent_counts = agent_data.get("connection", agent_data.get("status", {}))
+      if not isinstance(agent_counts, dict):
+          agent_counts = {}
+
+      result = {
+          "outputs": {
+              "opnsense_reachable": True,
+              "opnsense_interface_count": len(opnsense_interfaces),
+              "opnsense_time_available": bool(opnsense_time),
+              "wazuh_manager_reachable": True,
+              "wazuh_manager_count": len(manager_data),
+              "wazuh_agent_counts": agent_counts,
+              "wazuh_indexer_reachable": True,
+              "wazuh_indexer_status": str(indexer_health.get("status", "unknown")),
+              "wazuh_indexer_nodes": int(indexer_health.get("number_of_nodes", 0)),
+          }
+      }
+      print("::" + json.dumps(result, separators=(",", ":")) + "::")
